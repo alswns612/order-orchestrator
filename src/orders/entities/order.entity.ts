@@ -3,7 +3,7 @@ import {
   CreateDateColumn,
   Entity,
   OneToOne,
-  PrimaryGeneratedColumn,
+  PrimaryColumn,
   Unique,
   UpdateDateColumn,
 } from 'typeorm';
@@ -21,7 +21,8 @@ export interface OrderLineItem {
 @Entity('orders')
 @Unique(['idempotencyKey'])
 export class Order {
-  @PrimaryGeneratedColumn('uuid')
+  // 주문 ID는 애플리케이션에서 UUIDv7로 생성하여 저장한다.
+  @PrimaryColumn({ type: 'varchar', length: 36 })
   id!: string;
 
   @Column({ length: 64 })

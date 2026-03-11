@@ -2,7 +2,7 @@ import { Body, Controller, Get, Post, Query } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { DispatchOutboxDto } from './dto/dispatch-outbox.dto';
 import { SetFailureRuleDto } from './dto/set-failure-rule.dto';
-import { OrderEventConsumerService } from './order-event-consumer.service';
+import { FailureInjectionService } from './failure-injection.service';
 import { OutboxProcessorService } from './outbox-processor.service';
 
 @ApiTags('admin-outbox')
@@ -10,7 +10,7 @@ import { OutboxProcessorService } from './outbox-processor.service';
 export class OutboxAdminController {
   constructor(
     private readonly outboxProcessor: OutboxProcessorService,
-    private readonly eventConsumer: OrderEventConsumerService,
+    private readonly failureInjectionService: FailureInjectionService,
   ) {}
 
   @Get('pending')
@@ -36,13 +36,13 @@ export class OutboxAdminController {
   @Get('failure-rules')
   @ApiOperation({ summary: '실패 주입 규칙 조회' })
   getFailureRules() {
-    return this.eventConsumer.getFailureRules();
+    return this.failureInjectionService.getRules();
   }
 
   @Post('failure-rules')
   @ApiOperation({ summary: '실패 주입 규칙 설정/해제' })
   setFailureRule(@Body() dto: SetFailureRuleDto) {
-    this.eventConsumer.setFailureRule(dto.eventType, dto.failCount);
-    return this.eventConsumer.getFailureRules();
+    this.failureInjectionService.setRule(`EVENT:${dto.eventType}`, dto.failCount);
+    return this.failureInjectionService.getRules();
   }
 }

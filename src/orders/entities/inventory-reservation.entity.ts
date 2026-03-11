@@ -11,6 +11,7 @@ import { Order } from './order.entity';
 
 export enum InventoryReservationStatus {
   RESERVED = 'RESERVED',
+  CONFIRMED = 'CONFIRMED',
   RELEASED = 'RELEASED',
 }
 

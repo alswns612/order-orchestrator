@@ -7,6 +7,7 @@ import { Order, OrderLineItem } from '../src/orders/entities/order.entity';
 import { OrderStatus } from '../src/orders/order-status.enum';
 import { Payment, PaymentStatus } from '../src/orders/entities/payment.entity';
 import { Shipment, ShipmentStatus } from '../src/orders/entities/shipment.entity';
+import { generateUuidV7 } from '../src/common/utils/uuidv7.util';
 
 const dataSource = new DataSource({
   type: 'sqlite',
@@ -32,6 +33,7 @@ async function run(): Promise<void> {
   const items: OrderLineItem[] = [{ sku: 'SEED-SKU-1', qty: 1, price: 12000 }];
 
   const order = orderRepository.create({
+    id: generateUuidV7(),
     customerId: 'seed-customer',
     items,
     totalAmount: 12000,
