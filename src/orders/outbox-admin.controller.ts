@@ -14,33 +14,33 @@ export class OutboxAdminController {
   ) {}
 
   @Get('pending')
-  @ApiOperation({ summary: 'List pending outbox events' })
+  @ApiOperation({ summary: '대기 중인 Outbox 이벤트 조회' })
   async getPending(@Query('limit') limit?: string) {
     const parsedLimit = Number(limit ?? 50);
     return this.outboxProcessor.getPendingEvents(parsedLimit);
   }
 
   @Post('dispatch')
-  @ApiOperation({ summary: 'Dispatch pending outbox events once' })
+  @ApiOperation({ summary: 'Outbox 이벤트를 1회 수동 디스패치' })
   async dispatch(@Body() dto: DispatchOutboxDto) {
     return this.outboxProcessor.dispatchPending(dto.limit ?? 20, dto.force ?? false);
   }
 
   @Get('dlq')
-  @ApiOperation({ summary: 'List dead-letter events' })
+  @ApiOperation({ summary: 'Dead Letter Queue 이벤트 조회' })
   async getDlq(@Query('limit') limit?: string) {
     const parsedLimit = Number(limit ?? 50);
     return this.outboxProcessor.getDeadLetterEvents(parsedLimit);
   }
 
   @Get('failure-rules')
-  @ApiOperation({ summary: 'Read current failure injection rules' })
+  @ApiOperation({ summary: '실패 주입 규칙 조회' })
   getFailureRules() {
     return this.eventConsumer.getFailureRules();
   }
 
   @Post('failure-rules')
-  @ApiOperation({ summary: 'Set failure injection rule by eventType' })
+  @ApiOperation({ summary: '실패 주입 규칙 설정/해제' })
   setFailureRule(@Body() dto: SetFailureRuleDto) {
     this.eventConsumer.setFailureRule(dto.eventType, dto.failCount);
     return this.eventConsumer.getFailureRules();

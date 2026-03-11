@@ -24,10 +24,8 @@ export class OrdersService {
     private readonly dataSource: DataSource,
   ) {}
 
-  async create(
-    dto: CreateOrderDto,
-    idempotencyKey?: string,
-  ): Promise<Order> {
+  async create(dto: CreateOrderDto, idempotencyKey?: string): Promise<Order> {
+    // 동일 멱등키 요청이 이미 처리된 경우, 기존 주문을 그대로 반환한다.
     if (idempotencyKey) {
       const existing = await this.orderRepository.findOne({
         where: { idempotencyKey },
@@ -42,6 +40,7 @@ export class OrdersService {
     }, 0);
 
     const orderId = await this.dataSource.transaction(async (manager) => {
+      // 주문/결제/재고/배송/Outbox를 하나의 트랜잭션으로 묶어 데이터 정합성을 보장한다.
       const order = manager.create(Order, {
         customerId: dto.customerId,
         items: dto.items,
@@ -74,6 +73,7 @@ export class OrdersService {
       });
       await manager.save(shipment);
 
+      // Outbox 이벤트도 동일 트랜잭션에서 생성해 "주문 저장됐는데 이벤트 유실" 문제를 방지한다.
       const outboxEvent = manager.create(OutboxEvent, {
         aggregateType: 'Order',
         aggregateId: savedOrder.id,
@@ -103,6 +103,7 @@ export class OrdersService {
 
   async updateStatus(id: string, dto: UpdateOrderStatusDto): Promise<Order> {
     const order = await this.findById(id);
+    // 상태 전이 규칙을 먼저 검증한다.
     this.stateMachine.assertTransition(order.status, dto.status);
 
     await this.dataSource.transaction(async (manager) => {
@@ -115,6 +116,7 @@ export class OrdersService {
       targetOrder.status = dto.status;
       await manager.save(targetOrder);
 
+      // 상태 변화에 맞춰 하위 도메인(결제/배송)을 함께 반영한다.
       if (dto.status === OrderStatus.PAID) {
         const payment = await manager.findOne(Payment, { where: { orderId: id } });
         if (payment) {
@@ -142,6 +144,7 @@ export class OrdersService {
         }
       }
 
+      // 상태 변경 이벤트를 Outbox에 적재해 비동기 후처리 대상으로 넘긴다.
       const outboxEvent = manager.create(OutboxEvent, {
         aggregateType: 'Order',
         aggregateId: id,

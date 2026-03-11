@@ -27,6 +27,7 @@ export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
   ) {}
 
   onModuleInit(): void {
+    // 기본 동작: 주기적으로 Outbox를 폴링해서 발행 처리한다.
     const enabled = process.env.OUTBOX_PROCESSOR_ENABLED !== 'false';
     if (!enabled) {
       return;
@@ -36,6 +37,8 @@ export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
     this.timer = setInterval(() => {
       void this.dispatchPending(20, false);
     }, pollIntervalMs);
+
+    // 앱 종료를 막지 않도록 unref 처리한다.
     this.timer.unref();
   }
 
@@ -52,6 +55,7 @@ export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
       .orderBy('event.createdAt', 'ASC')
       .take(limit);
 
+    // force=false면 nextRetryAt이 도래한 이벤트만 처리한다.
     if (!force) {
       query.andWhere('(event.nextRetryAt IS NULL OR event.nextRetryAt <= :now)', {
         now: new Date().toISOString(),
@@ -106,11 +110,14 @@ export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
       return OutboxEventStatus.PENDING;
     }
 
+    // 동시 처리 중복을 줄이기 위해 PROCESSING으로 먼저 전환한다.
     event.status = OutboxEventStatus.PROCESSING;
     await this.outboxRepository.save(event);
 
     try {
       await this.eventConsumer.consume(event);
+
+      // 소비 성공 시 PUBLISHED 처리
       event.status = OutboxEventStatus.PUBLISHED;
       event.publishedAt = new Date();
       event.lastError = null;
@@ -121,6 +128,7 @@ export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
       const retryCount = event.retryCount + 1;
 
       if (retryCount >= event.maxRetries) {
+        // 재시도 한도 초과 시 Outbox 상태와 DLQ 적재를 한 트랜잭션으로 처리한다.
         await this.dataSource.transaction(async (manager) => {
           event.status = OutboxEventStatus.DEAD_LETTER;
           event.retryCount = retryCount;
@@ -146,6 +154,7 @@ export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
         return OutboxEventStatus.DEAD_LETTER;
       }
 
+      // 재시도 가능하면 PENDING으로 되돌리고 다음 시도 시간을 계산한다.
       event.status = OutboxEventStatus.PENDING;
       event.retryCount = retryCount;
       event.lastError = message;
@@ -157,6 +166,7 @@ export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
   }
 
   private calculateNextRetryAt(retryCount: number): Date {
+    // 지수 백오프: base * 2^(retryCount-1)
     const baseMs = Number(process.env.OUTBOX_RETRY_BASE_MS ?? 1000);
     const delay = Math.max(0, baseMs) * Math.pow(2, Math.max(0, retryCount - 1));
     return new Date(Date.now() + delay);
