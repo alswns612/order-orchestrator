@@ -62,13 +62,20 @@
 ### 5.1 설치 및 실행
 ```bash
 npm install
+
+# 통합 실행 (기존 방식, API + Outbox 폴링을 한 프로세스에서)
 npm run start:dev
+
+# 분리 실행 (API와 Worker를 독립 프로세스로)
+npm run start:api:dev    # API 전용 (포트 3000, Outbox 폴링 비활성화)
+npm run start:worker:dev # Worker 전용 (포트 3001, 헬스체크: GET /health)
 ```
 
 ### 5.2 환경 변수
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `PORT` | `3000` | 서버 포트 |
+| `PORT` | `3000` | API 서버 포트 |
+| `WORKER_PORT` | `3001` | Worker 헬스체크 포트 |
 | `DATABASE_PATH` | `order-orchestrator.sqlite` | SQLite 파일 경로 |
 | `OUTBOX_PROCESSOR_ENABLED` | `true` | Outbox 폴링 자동 실행 여부 |
 | `OUTBOX_POLL_INTERVAL_MS` | `3000` | Outbox 폴링 주기(ms) |
@@ -83,7 +90,9 @@ npm run start:dev
 ### 6.2 운영 API (Outbox)
 - `GET /admin/outbox/pending?limit=50`
 - `POST /admin/outbox/dispatch`
-- `GET /admin/outbox/dlq?limit=50`
+- `GET /admin/outbox/dlq?limit=50&offset=0&eventType=ORDER_CREATED`
+- `POST /admin/outbox/dlq/:id/reprocess`
+- `POST /admin/outbox/dlq/reprocess`
 - `GET /admin/outbox/failure-rules`
 - `POST /admin/outbox/failure-rules`
 
@@ -91,7 +100,16 @@ npm run start:dev
 ```json
 {
   "eventType": "ORDER_STATUS_CHANGED",
-  "failCount": 3
+  "failCount": 3,
+  "ttlMs": 60000
+}
+```
+
+`POST /admin/outbox/dlq/reprocess` 예시 (배치 재처리):
+```json
+{
+  "ids": ["uuid-1", "uuid-2"],
+  "eventType": "ORDER_CREATED"
 }
 ```
 
@@ -135,8 +153,10 @@ npm run seed
 ## 10. 디렉터리 구조 (핵심)
 ```txt
 src/
-  main.ts
+  main.ts              # API 진입점
   app.module.ts
+  worker.ts            # Worker 진입점
+  worker.module.ts
   common/
     utils/
       uuidv7.util.ts
@@ -160,3 +180,107 @@ src/
 
 ## 11. 문서
 - [Architecture](./docs/architecture.md)
+
+## 12. 남은 전체 개발 계획
+현재까지 완료 범위:
+- 주문 상태머신 + UUIDv7 주문 ID
+- Outbox 재시도/DLQ
+- Saga 오케스트레이션 + 보상 트랜잭션
+- 운영자 재처리/강제상태변경 + 감사로그
+- 운영 신뢰성 강화 (DLQ 재처리, TTL, 멱등 소비)
+
+아래는 남은 계획 전체입니다.
+
+### 12.1 ~~1순위: 운영 신뢰성 강화~~ ✅ 완료
+- [x] DLQ 재처리 API 구현
+- [x] DLQ 배치 재처리(필터/페이지네이션) 구현
+- [x] 실패 주입 규칙 TTL(만료시간) 지원
+- [x] Outbox Processor 멱등 소비 키(consumer dedup) 도입
+
+완료 기준:
+- DLQ 이벤트를 단건/배치로 재처리 가능
+- 동일 이벤트 중복 처리 시 상태 불일치가 발생하지 않음
+
+### 12.2 ~~1순위: 실행 구조 분리~~ ✅ 완료
+- [x] API 서버와 Worker 프로세스 분리(`start:api`, `start:worker`)
+- [x] Worker 헬스체크 엔드포인트 또는 heartbeat 지표 추가
+- [x] graceful shutdown(진행 중 작업 정리) 처리
+
+완료 기준:
+- API 장애와 Worker 장애가 서로 독립적으로 복구 가능
+- 배포 시 Worker 중단/재기동 과정에서 이벤트 유실이 없음
+
+### 12.3 1순위: 관측성(Observability)
+- [ ] OpenTelemetry Trace 연동
+- [ ] Prometheus 메트릭 수집
+- [ ] Grafana 대시보드 구성
+- [ ] Alert Rule 추가(DLQ 급증, 재시도 급증, 처리 지연)
+
+핵심 메트릭:
+- `order_saga_duration_ms`
+- `outbox_dispatch_success_total`
+- `outbox_dispatch_retry_total`
+- `outbox_dead_letter_total`
+- `order_reprocess_total`
+
+완료 기준:
+- 주문 1건의 전체 Saga 경로를 Trace로 추적 가능
+- 장애 시 5분 내 대시보드/알림으로 이상 탐지 가능
+
+### 12.4 2순위: 인프라 전환
+- [ ] DB를 SQLite -> PostgreSQL로 전환
+- [ ] Redis/브로커 도입으로 Outbox Polling 보완
+- [ ] Docker Compose에 Postgres/Redis/Prometheus/Grafana 통합
+
+완료 기준:
+- 로컬에서 `docker compose up`만으로 전체 환경 실행
+- DB 전환 후 테스트/빌드/시나리오 모두 통과
+
+### 12.5 2순위: CI/CD 정비
+- [ ] GitHub Actions 파이프라인 분리(lint/test/build)
+- [ ] 테스트 커버리지 리포트 업로드
+- [ ] 브랜치 보호 규칙 + PR 필수 체크 적용
+- [ ] dev/stage 자동 배포 파이프라인 구성
+
+완료 기준:
+- PR마다 자동 품질 게이트 동작
+- main 머지 시 dev 환경 자동 배포
+
+### 12.6 2순위: 품질/성능
+- [ ] 부하 테스트(k6) 시나리오 작성
+- [ ] 병목 쿼리 인덱스 최적화
+- [ ] N+1/락 경합 점검
+- [ ] 계약 테스트(CDC) 추가
+
+완료 기준:
+- 목표 TPS/응답시간 기준 충족
+- 부하 시나리오에서 DLQ 비정상 급증 없음
+
+### 12.7 3순위: 보안/거버넌스
+- [ ] 관리자 API 인증/권한(RBAC) 적용
+- [ ] 감사 로그 위변조 방지(서명/해시 체인) 적용
+- [ ] 민감 정보 마스킹 정책(로그/응답) 정리
+- [ ] 보안 점검 문서(Threat Model) 작성
+
+완료 기준:
+- 관리자 API 무인증 접근 차단
+- 감사로그 신뢰성 검증 가능
+
+### 12.8 포트폴리오 마무리 작업
+- [ ] 아키텍처 다이어그램(시퀀스/컴포넌트) 추가
+- [ ] 장애 시나리오 데모 스크립트 작성
+- [ ] 기술 결정 기록(ADR) 정리
+- [ ] 이력서용 5줄 요약 + 링크 정리
+
+완료 기준:
+- 면접 시 10분 데모 + 5분 Q&A 대응 가능한 자료 준비 완료
+
+### 12.9 실행 순서(권장)
+1. 운영 신뢰성 강화
+2. 실행 구조 분리
+3. 관측성
+4. 인프라 전환
+5. CI/CD 정비
+6. 품질/성능
+7. 보안/거버넌스
+8. 포트폴리오 마무리

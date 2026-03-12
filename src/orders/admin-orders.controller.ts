@@ -51,7 +51,7 @@ export class AdminOrdersController {
   @Post('failure-points')
   @ApiOperation({ summary: '실패 주입 포인트 설정/해제' })
   setFailurePoint(@Body() dto: SetFailurePointDto) {
-    this.failureInjectionService.setRule(dto.key, dto.failCount);
+    this.failureInjectionService.setRule(dto.key, dto.failCount, dto.ttlMs);
     return this.failureInjectionService.getRules();
   }
 }

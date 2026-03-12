@@ -1,6 +1,7 @@
-import { Body, Controller, Get, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { DispatchOutboxDto } from './dto/dispatch-outbox.dto';
+import { ReprocessDlqBatchDto } from './dto/reprocess-dlq.dto';
 import { SetFailureRuleDto } from './dto/set-failure-rule.dto';
 import { FailureInjectionService } from './failure-injection.service';
 import { OutboxProcessorService } from './outbox-processor.service';
@@ -27,10 +28,28 @@ export class OutboxAdminController {
   }
 
   @Get('dlq')
-  @ApiOperation({ summary: 'Dead Letter Queue 이벤트 조회' })
-  async getDlq(@Query('limit') limit?: string) {
+  @ApiOperation({ summary: 'Dead Letter Queue 이벤트 조회 (페이지네이션)' })
+  async getDlq(
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+    @Query('eventType') eventType?: string,
+  ) {
     const parsedLimit = Number(limit ?? 50);
-    return this.outboxProcessor.getDeadLetterEvents(parsedLimit);
+    const parsedOffset = Number(offset ?? 0);
+    return this.outboxProcessor.getDeadLetterEvents(parsedLimit, parsedOffset, eventType);
+  }
+
+  @Post('dlq/:id/reprocess')
+  @ApiOperation({ summary: 'DLQ 이벤트 단건 재처리' })
+  async reprocessDlqEvent(@Param('id') id: string) {
+    await this.outboxProcessor.reprocessDlqEvent(id);
+    return { id, status: 'reprocessed' };
+  }
+
+  @Post('dlq/reprocess')
+  @ApiOperation({ summary: 'DLQ 이벤트 배치 재처리 (필터/ID 목록)' })
+  async reprocessDlqBatch(@Body() dto: ReprocessDlqBatchDto) {
+    return this.outboxProcessor.reprocessDlqBatch(dto.ids, dto.eventType);
   }
 
   @Get('failure-rules')
@@ -42,7 +61,7 @@ export class OutboxAdminController {
   @Post('failure-rules')
   @ApiOperation({ summary: '실패 주입 규칙 설정/해제' })
   setFailureRule(@Body() dto: SetFailureRuleDto) {
-    this.failureInjectionService.setRule(`EVENT:${dto.eventType}`, dto.failCount);
+    this.failureInjectionService.setRule(`EVENT:${dto.eventType}`, dto.failCount, dto.ttlMs);
     return this.failureInjectionService.getRules();
   }
 }

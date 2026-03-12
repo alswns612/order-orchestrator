@@ -1,19 +1,33 @@
 import { Injectable } from '@nestjs/common';
 
+interface FailureRule {
+  failCount: number;
+  expiresAt?: Date | null;
+}
+
 @Injectable()
 export class FailureInjectionService {
-  private readonly rules = new Map<string, number>();
+  private readonly rules = new Map<string, FailureRule>();
 
-  setRule(key: string, failCount: number): void {
+  setRule(key: string, failCount: number, ttlMs?: number): void {
     if (failCount <= 0) {
       this.rules.delete(key);
       return;
     }
-    this.rules.set(key, failCount);
+    const expiresAt = ttlMs && ttlMs > 0 ? new Date(Date.now() + ttlMs) : null;
+    this.rules.set(key, { failCount, expiresAt });
   }
 
-  getRules(): Record<string, number> {
-    return Object.fromEntries(this.rules.entries());
+  getRules(): Record<string, { failCount: number; expiresAt: string | null }> {
+    this.purgeExpired();
+    const result: Record<string, { failCount: number; expiresAt: string | null }> = {};
+    for (const [key, rule] of this.rules.entries()) {
+      result[key] = {
+        failCount: rule.failCount,
+        expiresAt: rule.expiresAt?.toISOString() ?? null,
+      };
+    }
+    return result;
   }
 
   clear(): void {
@@ -21,12 +35,30 @@ export class FailureInjectionService {
   }
 
   throwIfConfigured(key: string, message?: string): void {
-    const remaining = this.rules.get(key) ?? 0;
-    if (remaining <= 0) {
+    const rule = this.rules.get(key);
+    if (!rule || rule.failCount <= 0) {
       return;
     }
 
-    this.rules.set(key, remaining - 1);
-    throw new Error(message ?? `Injected failure for ${key}. remaining=${remaining - 1}`);
+    // TTL 만료 시 규칙을 자동 해제한다.
+    if (rule.expiresAt && rule.expiresAt.getTime() < Date.now()) {
+      this.rules.delete(key);
+      return;
+    }
+
+    rule.failCount -= 1;
+    if (rule.failCount <= 0) {
+      this.rules.delete(key);
+    }
+    throw new Error(message ?? `Injected failure for ${key}. remaining=${rule.failCount}`);
+  }
+
+  private purgeExpired(): void {
+    const now = Date.now();
+    for (const [key, rule] of this.rules.entries()) {
+      if (rule.expiresAt && rule.expiresAt.getTime() < now) {
+        this.rules.delete(key);
+      }
+    }
   }
 }

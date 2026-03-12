@@ -12,10 +12,19 @@ export interface DispatchResult {
   deadLettered: number;
 }
 
+export interface DlqReprocessResult {
+  total: number;
+  success: number;
+  failed: number;
+  details: Array<{ id: string; status: 'success' | 'failed'; error?: string }>;
+}
+
 @Injectable()
 export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OutboxProcessorService.name);
   private timer?: NodeJS.Timeout;
+  private activeDispatchCount = 0;
+  private shuttingDown = false;
 
   constructor(
     @InjectRepository(OutboxEvent)
@@ -42,13 +51,43 @@ export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
     this.timer.unref();
   }
 
-  onModuleDestroy(): void {
+  async onModuleDestroy(): Promise<void> {
+    this.shuttingDown = true;
     if (this.timer) {
       clearInterval(this.timer);
     }
+
+    // 진행 중인 디스패치가 완료될 때까지 최대 10초 대기한다.
+    const deadline = Date.now() + 10_000;
+    while (this.activeDispatchCount > 0 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+
+    if (this.activeDispatchCount > 0) {
+      this.logger.warn(
+        `Shutdown timeout: ${this.activeDispatchCount} dispatch(es) still in progress`,
+      );
+    }
+  }
+
+  isHealthy(): boolean {
+    return !this.shuttingDown;
   }
 
   async dispatchPending(limit = 20, force = false): Promise<DispatchResult> {
+    if (this.shuttingDown) {
+      return { selected: 0, published: 0, retried: 0, deadLettered: 0 };
+    }
+
+    this.activeDispatchCount += 1;
+    try {
+      return await this._doDispatch(limit, force);
+    } finally {
+      this.activeDispatchCount -= 1;
+    }
+  }
+
+  private async _doDispatch(limit: number, force: boolean): Promise<DispatchResult> {
     const query = this.outboxRepository
       .createQueryBuilder('event')
       .where('event.status = :status', { status: OutboxEventStatus.PENDING })
@@ -97,22 +136,123 @@ export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  async getDeadLetterEvents(limit = 50): Promise<DeadLetterEvent[]> {
-    return this.deadLetterRepository.find({
-      order: { deadLetteredAt: 'DESC' },
-      take: limit,
+  async getDeadLetterEvents(
+    limit = 50,
+    offset = 0,
+    eventType?: string,
+  ): Promise<{ data: DeadLetterEvent[]; total: number }> {
+    const query = this.deadLetterRepository.createQueryBuilder('dle');
+
+    if (eventType) {
+      query.where('dle.eventType = :eventType', { eventType });
+    }
+
+    query.orderBy('dle.deadLetteredAt', 'DESC').skip(offset).take(limit);
+
+    const [data, total] = await query.getManyAndCount();
+    return { data, total };
+  }
+
+  async reprocessDlqEvent(dlqId: string): Promise<void> {
+    const dlqEvent = await this.deadLetterRepository.findOne({
+      where: { id: dlqId },
+    });
+    if (!dlqEvent) {
+      throw new Error(`DLQ event not found: ${dlqId}`);
+    }
+
+    // 원본 Outbox 이벤트를 PENDING으로 복원하고 DLQ 레코드를 삭제한다.
+    await this.dataSource.transaction(async (manager) => {
+      const outboxEvent = await manager.findOne(OutboxEvent, {
+        where: { id: dlqEvent.sourceEventId },
+      });
+
+      if (outboxEvent) {
+        outboxEvent.status = OutboxEventStatus.PENDING;
+        outboxEvent.retryCount = 0;
+        outboxEvent.lastError = null;
+        outboxEvent.nextRetryAt = null;
+        await manager.save(outboxEvent);
+      } else {
+        // 원본이 없으면 새 Outbox 이벤트를 생성한다.
+        const newEvent = manager.create(OutboxEvent, {
+          aggregateType: dlqEvent.aggregateType,
+          aggregateId: dlqEvent.aggregateId,
+          eventType: dlqEvent.eventType,
+          payload: dlqEvent.payload,
+          status: OutboxEventStatus.PENDING,
+          retryCount: 0,
+          maxRetries: 3,
+        });
+        await manager.save(newEvent);
+      }
+
+      await manager.remove(dlqEvent);
     });
   }
 
+  async reprocessDlqBatch(
+    ids?: string[],
+    eventType?: string,
+  ): Promise<DlqReprocessResult> {
+    let targets: DeadLetterEvent[];
+
+    if (ids && ids.length > 0) {
+      targets = await this.deadLetterRepository.find({
+        where: ids.map((id) => ({ id })),
+      });
+    } else {
+      const query = this.deadLetterRepository.createQueryBuilder('dle');
+      if (eventType) {
+        query.where('dle.eventType = :eventType', { eventType });
+      }
+      query.take(100);
+      targets = await query.getMany();
+    }
+
+    const result: DlqReprocessResult = {
+      total: targets.length,
+      success: 0,
+      failed: 0,
+      details: [],
+    };
+
+    for (const dlqEvent of targets) {
+      try {
+        await this.reprocessDlqEvent(dlqEvent.id);
+        result.success += 1;
+        result.details.push({ id: dlqEvent.id, status: 'success' });
+      } catch (error) {
+        result.failed += 1;
+        const message = error instanceof Error ? error.message : String(error);
+        result.details.push({ id: dlqEvent.id, status: 'failed', error: message });
+      }
+    }
+
+    return result;
+  }
+
   private async processSingleEvent(id: string): Promise<OutboxEventStatus> {
-    const event = await this.outboxRepository.findOne({ where: { id } });
-    if (!event || event.status !== OutboxEventStatus.PENDING) {
+    // 원자적 UPDATE로 PENDING → PROCESSING 전환하여 동시 소비를 방지한다.
+    const claimed = await this.outboxRepository
+      .createQueryBuilder()
+      .update(OutboxEvent)
+      .set({ status: OutboxEventStatus.PROCESSING })
+      .where('id = :id AND status = :status', {
+        id,
+        status: OutboxEventStatus.PENDING,
+      })
+      .execute();
+
+    // affected가 0이면 이미 다른 프로세스가 선점했거나 상태가 PENDING이 아니다.
+    if (!claimed.affected || claimed.affected === 0) {
       return OutboxEventStatus.PENDING;
     }
 
-    // 동시 처리 중복을 줄이기 위해 PROCESSING으로 먼저 전환한다.
-    event.status = OutboxEventStatus.PROCESSING;
-    await this.outboxRepository.save(event);
+    const event = await this.outboxRepository.findOne({ where: { id } });
+    if (!event) {
+      return OutboxEventStatus.PENDING;
+    }
 
     try {
       await this.eventConsumer.consume(event);
