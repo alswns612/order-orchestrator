@@ -1,0 +1,21 @@
+# Prometheus 스크랩 설정
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # API 서버 메트릭
+  - job_name: 'order-orchestrator-api'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:3000']
+        labels:
+          service: api
+
+  # Worker 메트릭
+  - job_name: 'order-orchestrator-worker'
+    metrics_path: /metrics
+    static_configs:
+      - targets: ['host.docker.internal:3001']
+        labels:
+          service: worker

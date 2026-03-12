@@ -1,10 +1,12 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { AppController } from './app.controller';
+import { TelemetryModule } from './common/telemetry/telemetry.module';
 import { OrdersModule } from './orders/orders.module';
 
 @Module({
   imports: [
+    TelemetryModule,
     TypeOrmModule.forRootAsync({
       useFactory: () => ({
         type: 'sqlite' as const,

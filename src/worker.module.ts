@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { TypeOrmModule } from '@nestjs/typeorm';
+import { TelemetryModule } from './common/telemetry/telemetry.module';
 import { AuditLog } from './orders/entities/audit-log.entity';
 import { DeadLetterEvent } from './orders/entities/dead-letter-event.entity';
 import { InventoryReservation } from './orders/entities/inventory-reservation.entity';
@@ -17,6 +18,7 @@ import { SagaOrchestratorService } from './orders/saga-orchestrator.service';
 
 @Module({
   imports: [
+    TelemetryModule,
     TypeOrmModule.forRootAsync({
       useFactory: () => ({
         type: 'sqlite' as const,

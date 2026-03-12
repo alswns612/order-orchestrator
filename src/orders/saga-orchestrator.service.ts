@@ -1,6 +1,8 @@
 import { ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { trace, SpanStatusCode } from '@opentelemetry/api';
 import { DataSource, Repository } from 'typeorm';
+import { MetricsService } from '../common/telemetry/metrics.service';
 import { AuditLogService } from './audit-log.service';
 import {
   InventoryReservation,
@@ -32,8 +34,11 @@ export class SagaOrchestratorService {
     private readonly ordersService: OrdersService,
     private readonly auditLogService: AuditLogService,
     private readonly failureInjectionService: FailureInjectionService,
+    private readonly metricsService: MetricsService,
     private readonly dataSource: DataSource,
   ) {}
+
+  private readonly tracer = trace.getTracer('saga-orchestrator');
 
   async handleOrderCreated(orderId: string): Promise<void> {
     const order = await this.orderRepository.findOne({ where: { id: orderId } });
@@ -108,31 +113,72 @@ export class SagaOrchestratorService {
   }
 
   private async executeSaga(orderId: string, actor: string): Promise<void> {
-    const context: CompensationContext = {
-      paymentAuthorized: false,
-      inventoryConfirmed: false,
-    };
+    const end = this.metricsService.sagaDuration.startTimer();
 
-    await this.auditLogService.log(orderId, 'SAGA_STARTED', actor);
+    return this.tracer.startActiveSpan('saga.execute', async (span) => {
+      span.setAttribute('order.id', orderId);
+      const context: CompensationContext = {
+        paymentAuthorized: false,
+        inventoryConfirmed: false,
+      };
 
-    try {
-      await this.authorizePayment(orderId, actor);
-      context.paymentAuthorized = true;
+      await this.auditLogService.log(orderId, 'SAGA_STARTED', actor);
 
-      await this.ordersService.updateStatus(orderId, { status: OrderStatus.PAID });
-      await this.auditLogService.log(orderId, 'ORDER_MARKED_PAID', actor);
+      try {
+        await this.executeStep('payment_authorize', () =>
+          this.authorizePayment(orderId, actor),
+        );
+        context.paymentAuthorized = true;
 
-      await this.confirmInventory(orderId, actor);
-      context.inventoryConfirmed = true;
+        await this.ordersService.updateStatus(orderId, { status: OrderStatus.PAID });
+        await this.auditLogService.log(orderId, 'ORDER_MARKED_PAID', actor);
 
-      await this.requestShipment(orderId, actor);
-      await this.ordersService.updateStatus(orderId, { status: OrderStatus.SHIPPED });
+        await this.executeStep('inventory_confirm', () =>
+          this.confirmInventory(orderId, actor),
+        );
+        context.inventoryConfirmed = true;
 
-      await this.auditLogService.log(orderId, 'SAGA_COMPLETED', actor);
-    } catch (error) {
-      await this.compensate(orderId, actor, context, error);
-      throw error;
-    }
+        await this.executeStep('shipment_request', () =>
+          this.requestShipment(orderId, actor),
+        );
+        await this.ordersService.updateStatus(orderId, { status: OrderStatus.SHIPPED });
+
+        await this.auditLogService.log(orderId, 'SAGA_COMPLETED', actor);
+        this.metricsService.sagaTotal.inc({ result: 'success' });
+        span.setStatus({ code: SpanStatusCode.OK });
+      } catch (error) {
+        await this.compensate(orderId, actor, context, error);
+        this.metricsService.sagaTotal.inc({ result: 'compensated' });
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      } finally {
+        end();
+        span.end();
+      }
+    });
+  }
+
+  /** Saga 단계를 child span으로 감싸고 메트릭을 기록한다. */
+  private async executeStep(step: string, fn: () => Promise<void>): Promise<void> {
+    return this.tracer.startActiveSpan(`saga.step.${step}`, async (span) => {
+      try {
+        await fn();
+        this.metricsService.sagaStepTotal.inc({ step, result: 'success' });
+        span.setStatus({ code: SpanStatusCode.OK });
+      } catch (error) {
+        this.metricsService.sagaStepTotal.inc({ step, result: 'failed' });
+        span.setStatus({
+          code: SpanStatusCode.ERROR,
+          message: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      } finally {
+        span.end();
+      }
+    });
   }
 
   private async authorizePayment(orderId: string, actor: string): Promise<void> {

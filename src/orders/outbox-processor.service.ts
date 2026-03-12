@@ -1,6 +1,8 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
+import { trace, SpanStatusCode } from '@opentelemetry/api';
 import { DataSource, Repository } from 'typeorm';
+import { MetricsService } from '../common/telemetry/metrics.service';
 import { DeadLetterEvent } from './entities/dead-letter-event.entity';
 import { OutboxEvent, OutboxEventStatus } from './entities/outbox-event.entity';
 import { OrderEventConsumerService } from './order-event-consumer.service';
@@ -32,8 +34,11 @@ export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
     @InjectRepository(DeadLetterEvent)
     private readonly deadLetterRepository: Repository<DeadLetterEvent>,
     private readonly eventConsumer: OrderEventConsumerService,
+    private readonly metricsService: MetricsService,
     private readonly dataSource: DataSource,
   ) {}
+
+  private readonly tracer = trace.getTracer('outbox-processor');
 
   onModuleInit(): void {
     // 기본 동작: 주기적으로 Outbox를 폴링해서 발행 처리한다.
@@ -88,44 +93,60 @@ export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async _doDispatch(limit: number, force: boolean): Promise<DispatchResult> {
-    const query = this.outboxRepository
-      .createQueryBuilder('event')
-      .where('event.status = :status', { status: OutboxEventStatus.PENDING })
-      .orderBy('event.createdAt', 'ASC')
-      .take(limit);
+    const end = this.metricsService.outboxDispatchDuration.startTimer();
 
-    // force=false면 nextRetryAt이 도래한 이벤트만 처리한다.
-    if (!force) {
-      query.andWhere('(event.nextRetryAt IS NULL OR event.nextRetryAt <= :now)', {
-        now: new Date().toISOString(),
-      });
-    }
+    return this.tracer.startActiveSpan('outbox.dispatch', async (span) => {
+      try {
+        const query = this.outboxRepository
+          .createQueryBuilder('event')
+          .where('event.status = :status', { status: OutboxEventStatus.PENDING })
+          .orderBy('event.createdAt', 'ASC')
+          .take(limit);
 
-    const events = await query.getMany();
+        // force=false면 nextRetryAt이 도래한 이벤트만 처리한다.
+        if (!force) {
+          query.andWhere('(event.nextRetryAt IS NULL OR event.nextRetryAt <= :now)', {
+            now: new Date().toISOString(),
+          });
+        }
 
-    let published = 0;
-    let retried = 0;
-    let deadLettered = 0;
+        const events = await query.getMany();
+        span.setAttribute('outbox.batch_size', events.length);
 
-    for (const event of events) {
-      const result = await this.processSingleEvent(event.id);
-      if (result === OutboxEventStatus.PUBLISHED) {
-        published += 1;
+        // PENDING 게이지 갱신
+        const pendingCount = await this.outboxRepository.count({
+          where: { status: OutboxEventStatus.PENDING },
+        });
+        this.metricsService.outboxPendingGauge.set(pendingCount);
+
+        let published = 0;
+        let retried = 0;
+        let deadLettered = 0;
+
+        for (const event of events) {
+          const result = await this.processSingleEvent(event.id);
+          if (result === OutboxEventStatus.PUBLISHED) {
+            published += 1;
+            this.metricsService.outboxDispatchTotal.inc({ status: 'published' });
+          }
+          if (result === OutboxEventStatus.PENDING) {
+            retried += 1;
+            this.metricsService.outboxDispatchTotal.inc({ status: 'retried' });
+          }
+          if (result === OutboxEventStatus.DEAD_LETTER) {
+            deadLettered += 1;
+            this.metricsService.outboxDispatchTotal.inc({ status: 'dead_lettered' });
+            this.metricsService.dlqTotal.inc();
+          }
+        }
+
+        span.setStatus({ code: SpanStatusCode.OK });
+        return { selected: events.length, published, retried, deadLettered };
+      } finally {
+        end();
+        span.end();
       }
-      if (result === OutboxEventStatus.PENDING) {
-        retried += 1;
-      }
-      if (result === OutboxEventStatus.DEAD_LETTER) {
-        deadLettered += 1;
-      }
-    }
-
-    return {
-      selected: events.length,
-      published,
-      retried,
-      deadLettered,
-    };
+    });
   }
 
   async getPendingEvents(limit = 50): Promise<OutboxEvent[]> {
@@ -222,10 +243,12 @@ export class OutboxProcessorService implements OnModuleInit, OnModuleDestroy {
         await this.reprocessDlqEvent(dlqEvent.id);
         result.success += 1;
         result.details.push({ id: dlqEvent.id, status: 'success' });
+        this.metricsService.dlqReprocessTotal.inc({ result: 'success' });
       } catch (error) {
         result.failed += 1;
         const message = error instanceof Error ? error.message : String(error);
         result.details.push({ id: dlqEvent.id, status: 'failed', error: message });
+        this.metricsService.dlqReprocessTotal.inc({ result: 'failed' });
       }
     }
 

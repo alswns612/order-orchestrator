@@ -1,3 +1,6 @@
+// OpenTelemetry SDK는 다른 모듈보다 먼저 초기화해야 한다.
+import './common/telemetry/tracing';
+
 import { ValidationPipe } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';

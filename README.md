@@ -80,6 +80,17 @@ npm run start:worker:dev # Worker 전용 (포트 3001, 헬스체크: GET /health
 | `OUTBOX_PROCESSOR_ENABLED` | `true` | Outbox 폴링 자동 실행 여부 |
 | `OUTBOX_POLL_INTERVAL_MS` | `3000` | Outbox 폴링 주기(ms) |
 | `OUTBOX_RETRY_BASE_MS` | `1000` | 재시도 지수 백오프 기준(ms) |
+| `OTEL_SERVICE_NAME` | `order-orchestrator` | OpenTelemetry 서비스 이름 |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318/v1/traces` | OTLP Trace 수집기 주소 |
+
+### 5.3 관측성 스택 (Prometheus + Grafana + Jaeger)
+```bash
+docker compose -f docker-compose.observability.yml up -d
+```
+- Prometheus: http://localhost:9090
+- Grafana: http://localhost:3100 (admin/admin)
+- Jaeger UI: http://localhost:16686
+- 앱 메트릭: http://localhost:3000/metrics
 
 ## 6. API 상세
 ### 6.1 주문 API
@@ -158,6 +169,11 @@ src/
   worker.ts            # Worker 진입점
   worker.module.ts
   common/
+    telemetry/
+      tracing.ts           # OpenTelemetry Trace SDK 초기화
+      metrics.service.ts   # Prometheus 메트릭 서비스
+      metrics.controller.ts# /metrics 엔드포인트
+      telemetry.module.ts  # Global 텔레메트리 모듈
     utils/
       uuidv7.util.ts
   orders/
@@ -188,6 +204,8 @@ src/
 - Saga 오케스트레이션 + 보상 트랜잭션
 - 운영자 재처리/강제상태변경 + 감사로그
 - 운영 신뢰성 강화 (DLQ 재처리, TTL, 멱등 소비)
+- API/Worker 프로세스 분리 + graceful shutdown
+- 관측성: OpenTelemetry Trace + Prometheus 메트릭 + Grafana/Jaeger
 
 아래는 남은 계획 전체입니다.
 
@@ -210,22 +228,27 @@ src/
 - API 장애와 Worker 장애가 서로 독립적으로 복구 가능
 - 배포 시 Worker 중단/재기동 과정에서 이벤트 유실이 없음
 
-### 12.3 1순위: 관측성(Observability)
-- [ ] OpenTelemetry Trace 연동
-- [ ] Prometheus 메트릭 수집
-- [ ] Grafana 대시보드 구성
+### 12.3 ~~1순위: 관측성(Observability)~~ ✅ 완료
+- [x] OpenTelemetry Trace 연동 (Jaeger OTLP exporter)
+- [x] Prometheus 메트릭 수집 (`/metrics` 엔드포인트)
+- [x] Saga/Outbox/DLQ 비즈니스 메트릭 계측
+- [x] Docker Compose 관측성 스택 (Prometheus + Grafana + Jaeger)
+- [ ] Grafana 대시보드 JSON 프리셋 추가
 - [ ] Alert Rule 추가(DLQ 급증, 재시도 급증, 처리 지연)
 
-핵심 메트릭:
-- `order_saga_duration_ms`
-- `outbox_dispatch_success_total`
-- `outbox_dispatch_retry_total`
-- `outbox_dead_letter_total`
-- `order_reprocess_total`
+구현 메트릭:
+- `saga_executions_total{result}` — Saga 실행 결과 (success/compensated)
+- `saga_duration_seconds` — Saga 소요 시간 히스토그램
+- `saga_step_total{step,result}` — Saga 단계별 성공/실패
+- `outbox_dispatch_total{status}` — Outbox 디스패치 결과 (published/retried/dead_lettered)
+- `outbox_dispatch_duration_seconds` — 디스패치 사이클 소요 시간
+- `outbox_pending_events` — PENDING 이벤트 수 게이지
+- `dlq_events_total` — DLQ 적재 건수
+- `dlq_reprocess_total{result}` — DLQ 재처리 결과
 
 완료 기준:
-- 주문 1건의 전체 Saga 경로를 Trace로 추적 가능
-- 장애 시 5분 내 대시보드/알림으로 이상 탐지 가능
+- 주문 1건의 전체 Saga 경로를 Trace로 추적 가능 ✅
+- `/metrics` 엔드포인트에서 모든 비즈니스 메트릭 확인 가능 ✅
 
 ### 12.4 2순위: 인프라 전환
 - [ ] DB를 SQLite -> PostgreSQL로 전환
